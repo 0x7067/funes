@@ -906,43 +906,43 @@ async fn scan_sessions(ds: &Dataset) -> Result<Vec<Session>> {
     if has_col(ds, "repo") {
         cols.push("repo");
     }
-    let batches = dataset::scan_rows(ds, &cols, None, None).await?;
-
-    let mut by_id: HashMap<String, (Session, HashSet<(i64, String)>)> = HashMap::new();
-    for batch in &batches {
-        let (sid, ts, wd, turn, harness, repo) = (
-            scol(batch, "session_id"),
-            scol(batch, "ts"),
-            scol(batch, "workdir"),
-            scol(batch, "turn_uuid"),
-            scol(batch, "harness"),
-            scol(batch, "repo"),
-        );
-        let seq = icol(batch, "seq");
-        for i in 0..batch.num_rows() {
-            let id = sval(sid, i);
-            let (session, turns) = by_id.entry(id.clone()).or_insert_with(|| {
-                (
-                    Session {
-                        session_id: id,
-                        ts: sval(ts, i),
-                        workdir: sval(wd, i),
-                        harness: sval(harness, i),
-                        repo: sval(repo, i),
-                        turns: 0,
-                        first_prompt: String::new(),
-                    },
-                    HashSet::new(),
-                )
-            });
-            // Rows arrive in scan order, not time order, so the first one seen isn't the earliest.
-            let row_ts = sval(ts, i);
-            if row_ts < session.ts {
-                session.ts = row_ts;
+    let by_id: HashMap<String, (Session, HashSet<(i64, String)>)> =
+        dataset::scan_fold(ds, &cols, None, None, HashMap::new(), |mut by_id, batch| {
+            let (sid, ts, wd, turn, harness, repo) = (
+                scol(&batch, "session_id"),
+                scol(&batch, "ts"),
+                scol(&batch, "workdir"),
+                scol(&batch, "turn_uuid"),
+                scol(&batch, "harness"),
+                scol(&batch, "repo"),
+            );
+            let seq = icol(&batch, "seq");
+            for i in 0..batch.num_rows() {
+                let id = sval(sid, i);
+                let (session, turns) = by_id.entry(id.clone()).or_insert_with(|| {
+                    (
+                        Session {
+                            session_id: id,
+                            ts: sval(ts, i),
+                            workdir: sval(wd, i),
+                            harness: sval(harness, i),
+                            repo: sval(repo, i),
+                            turns: 0,
+                            first_prompt: String::new(),
+                        },
+                        HashSet::new(),
+                    )
+                });
+                // Rows arrive in scan order, not time order, so the first one seen isn't the earliest.
+                let row_ts = sval(ts, i);
+                if row_ts < session.ts {
+                    session.ts = row_ts;
+                }
+                turns.insert((ival(seq, i), sval(turn, i)));
             }
-            turns.insert((ival(seq, i), sval(turn, i)));
-        }
-    }
+            by_id
+        })
+        .await?;
 
     let mut out: Vec<Session> = by_id
         .into_values()

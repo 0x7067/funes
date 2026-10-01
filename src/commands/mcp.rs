@@ -11,6 +11,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RecallRequest {
@@ -152,6 +154,11 @@ pub(crate) struct Funes {
     /// Explicit memory spec (`funes mcp <memory>`), pinned for the server's lifetime. `None` reads
     /// the local memory unless a call passes its own `memory`.
     memory: Option<String>,
+    /// Serializes tool calls: rmcp dispatches each request on its own task, so calls would
+    /// otherwise run concurrently, and every verb peaks at hundreds of MB while it scans the
+    /// memory — unbounded concurrency multiplies the long-lived server's footprint. One call at
+    /// a time caps the peak at a single call's working set.
+    work: Arc<Mutex<()>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Funes>,
 }
@@ -161,6 +168,7 @@ impl Funes {
     fn new(memory: Option<String>) -> Self {
         Self {
             memory,
+            work: Arc::new(Mutex::new(())),
             tool_router: Self::tool_router(),
         }
     }
@@ -187,6 +195,7 @@ impl Funes {
             memory,
         }): Parameters<RecallRequest>,
     ) -> String {
+        let _work = self.work.lock().await;
         noted(
             self.memory.as_deref(),
             match recall::recall(
@@ -220,6 +229,7 @@ impl Funes {
             memory,
         }): Parameters<GetRequest>,
     ) -> String {
+        let _work = self.work.lock().await;
         let range = recall::TurnRange { from, to };
         noted(
             self.memory.as_deref(),
@@ -245,6 +255,7 @@ impl Funes {
             memory,
         }): Parameters<SessionsRequest>,
     ) -> String {
+        let _work = self.work.lock().await;
         let filter = recall::SessionFilter {
             repo,
             since,
@@ -277,6 +288,7 @@ impl Funes {
             memory,
         }): Parameters<ScanRequest>,
     ) -> String {
+        let _work = self.work.lock().await;
         noted(
             self.memory.as_deref(),
             match recall::scan(
@@ -311,6 +323,7 @@ impl Funes {
             memory,
         }): Parameters<SketchRequest>,
     ) -> String {
+        let _work = self.work.lock().await;
         noted(
             self.memory.as_deref(),
             match super::sketch::run(self.memory(memory), session_id, from, to, units, max_chars).await {
@@ -325,6 +338,7 @@ impl Funes {
         description = "Health and size of a memory: how much is indexed, what is still pending, and for a remote what this host has yet to push. Call it when a read comes back empty or thinner than expected — it says whether the memory is the problem rather than the call."
     )]
     async fn status(&self, Parameters(StatusRequest { memory }): Parameters<StatusRequest>) -> String {
+        let _work = self.work.lock().await;
         // No update check here: it needs the network, and the "update available" notice belongs
         // on the human-facing CLI `funes status`, not on this hot, otherwise-local tool path.
         noted(

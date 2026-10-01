@@ -117,6 +117,33 @@ pub async fn scan_rows(
     Ok(batches)
 }
 
+/// [`scan_rows`] with the batches folded in as they stream — the caller's accumulator sees one
+/// batch at a time instead of a collected `Vec`, so a whole-table scan peaks at the in-flight
+/// batches plus the fold state rather than the full result.
+pub async fn scan_fold<T>(
+    ds: &Dataset,
+    columns: &[&str],
+    filter: Option<&str>,
+    limit: Option<i64>,
+    init: T,
+    mut fold: impl FnMut(T, RecordBatch) -> T,
+) -> Result<T> {
+    let mut scan = ds.scan();
+    if !columns.is_empty() {
+        scan.project(columns)?;
+    }
+    if let Some(f) = filter {
+        scan.filter(f)?;
+    }
+    scan.limit(limit, None)?;
+    let mut stream = scan.try_into_stream().await?;
+    let mut acc = init;
+    while let Some(batch) = stream.try_next().await? {
+        acc = fold(acc, batch);
+    }
+    Ok(acc)
+}
+
 /// lance's default `<column>_idx` names, so an index lance named is refreshed, not rebuilt beside.
 pub(crate) const FTS_INDEX: &str = "text_idx";
 pub(crate) const VECTOR_INDEX: &str = "vector_idx";
