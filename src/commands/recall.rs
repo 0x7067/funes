@@ -1152,25 +1152,22 @@ async fn scan_sessions(ds: &Dataset) -> Result<Vec<Session>> {
     if has_col(ds, "repo") {
         cols.push("repo");
     }
-    let batches = dataset::scan_rows(ds, &cols, None, None).await?;
-
     // A session's fold: its distinct turns and the highest seq seen, which names the last one.
     struct Fold {
         session: Session,
         turns: HashSet<(i64, String)>,
         last_seq: i64,
     }
-    let mut by_id: HashMap<String, Fold> = HashMap::new();
-    for batch in &batches {
+    let by_id: HashMap<String, Fold> = dataset::scan_fold(ds, &cols, None, None, HashMap::new(), |mut by_id, batch| {
         let (sid, ts, wd, turn, harness, repo) = (
-            scol(batch, "session_id"),
-            scol(batch, "ts"),
-            scol(batch, "workdir"),
-            scol(batch, "turn_uuid"),
-            scol(batch, "harness"),
-            scol(batch, "repo"),
+            scol(&batch, "session_id"),
+            scol(&batch, "ts"),
+            scol(&batch, "workdir"),
+            scol(&batch, "turn_uuid"),
+            scol(&batch, "harness"),
+            scol(&batch, "repo"),
         );
-        let seq = icol(batch, "seq");
+        let seq = icol(&batch, "seq");
         for i in 0..batch.num_rows() {
             let id = sval(sid, i);
             let row_seq = ival(seq, i);
@@ -1201,7 +1198,9 @@ async fn scan_sessions(ds: &Dataset) -> Result<Vec<Session>> {
             }
             fold.turns.insert((row_seq, sval(turn, i)));
         }
-    }
+        by_id
+    })
+    .await?;
 
     let mut out: Vec<Session> = by_id
         .into_values()
