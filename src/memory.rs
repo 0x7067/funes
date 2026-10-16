@@ -9,7 +9,8 @@
 //! Below it: [`dataset`], [`fetch_store`] and [`capture_store`] are **mechanics** — Lance and object
 //! stores, knowing nothing about the Hub. [`remote`] is **transport** — the pinned reads and the
 //! commits of an append or a compaction, over the Hub client in [`crate::hub`].
-//! [`card`] serves a published memory's dataset card, [`lock`] the local writer lock.
+//! [`card`] serves a published memory's dataset card, [`lock`] the local writer lock, [`receipt`]
+//! what this host pushed to each remote.
 //!
 //! The commands ask this module what state a memory is in; they never infer it from error shapes.
 
@@ -18,16 +19,18 @@ pub mod card;
 pub mod dataset;
 pub mod fetch_store;
 pub mod lock;
+pub mod receipt;
 pub mod remote;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use hf_hub::HFError;
 use lance::dataset::Dataset;
 
+use crate::home;
 use crate::hub::{client, hf_token, is_offline_error, is_remote_shorthand, parse_hf};
 use dataset::DIM;
 
@@ -40,15 +43,14 @@ pub enum Memory {
     Remote { uri: String },
 }
 
-/// The branch reads pin to and resolve the head commit of. It must be the branch writes target, so a
-/// read sees the commits a push produced.
+/// The branch reads pin to and writes commit to, so a read sees the commits a push produced.
 const READ_BRANCH: &str = "main";
 
 impl Memory {
     /// The default local memory (`$FUNES_HOME` / `~/.funes` → `…/memory`).
     pub fn local() -> Self {
         Memory::Local {
-            path: PathBuf::from(dataset::local_memory_dir()),
+            path: home::memory_dir(),
         }
     }
 
@@ -70,9 +72,9 @@ impl Memory {
         }
     }
 
-    /// Resolve the memory the read commands should use: an explicit `spec` (a CLI `--memory`), else
-    /// the local index. There is no persisted default — a memory binding lives in the caller's
-    /// config (e.g. an agent's `funes mcp <memory>` registration), not in funes.
+    /// Resolve the memory a write command acts on: an explicit `spec`, else the local memory. What a
+    /// read command reads is [`crate::commands::target::Target`]'s to resolve: naming no memory, it
+    /// defaults to the one this host is bound to.
     pub fn resolve(spec: Option<String>) -> Self {
         match spec.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             Some(s) => Memory::parse(&s),
@@ -83,7 +85,7 @@ impl Memory {
     /// True only for the default local memory (`$FUNES_HOME`/`~/.funes`), so the hello-world
     /// fallback fires only there — never masking a missing explicit memory.
     pub fn is_default_local(&self) -> bool {
-        matches!(self, Memory::Local { path } if path.as_path() == Path::new(&dataset::local_memory_dir()))
+        matches!(self, Memory::Local { path } if *path == home::memory_dir())
     }
 
     /// Short label for output/provenance.
@@ -99,9 +101,7 @@ impl Memory {
     /// matching dimension doesn't prove a matching embedding model.
     pub async fn open(&self) -> Result<Dataset> {
         let ds = match self {
-            Memory::Local { path } => {
-                dataset::open(&dataset::table_uri(&path.to_string_lossy()), HashMap::new()).await?
-            }
+            Memory::Local { path } => dataset::open(&dataset::table_uri(path), HashMap::new()).await?,
             Memory::Remote { uri } => {
                 let (owner, name, _) = parse_hf(uri)?;
                 let token = hf_token();
@@ -155,6 +155,25 @@ impl Memory {
             Err(e) => Err(e),
         }
     }
+
+    /// The memory's dataset, with rows or without: a memory with no rows yet still records its
+    /// embedding model. `None` when it holds no dataset. A memory that can't be read is an error,
+    /// worded by its state.
+    pub async fn dataset(&self) -> Result<Option<Dataset>> {
+        match self.state().await? {
+            MemoryState::Ready(ds) => Ok(Some(ds)),
+            // A remote's `Empty` is a repo with no dataset; a local one may be a dataset with no rows.
+            MemoryState::Empty if matches!(self, Memory::Local { .. }) => match self.open().await {
+                Ok(ds) => Ok(Some(ds)),
+                Err(e) if dataset_absent(&e) => Ok(None),
+                Err(e) => Err(e),
+            },
+            MemoryState::Empty => Ok(None),
+            MemoryState::Missing => Err(self.missing_error()),
+            MemoryState::Unauthorized => Err(self.unauthorized_error()),
+            MemoryState::Offline => Err(self.offline_error()),
+        }
+    }
 }
 
 /// How the states that always refuse read to the user. One method per [`MemoryState`] variant that
@@ -166,6 +185,14 @@ impl Memory {
         anyhow!(
             "{} doesn't exist on the Hub, and funes won't create it — create the dataset repo \
              first (https://huggingface.co/new-dataset)",
+            self.label()
+        )
+    }
+
+    /// [`MemoryState::Offline`]: the remote can't be reached right now.
+    pub fn offline_error(&self) -> anyhow::Error {
+        anyhow!(
+            "{} is unreachable right now — check your connection, then try again",
             self.label()
         )
     }
@@ -296,10 +323,60 @@ fn check_compat(ds: &Dataset) -> Result<()> {
     }
 }
 
+/// The memory this host is bound to: the one `funes add` installs every agent to read and publish
+/// to, as typed to it. `None` when the host is local.
+pub fn binding() -> Result<Option<String>> {
+    binding_at(&home::bound_file())
+}
+
+/// [`binding`], read from the file at `path`.
+pub fn binding_at(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text.trim().to_string()).filter(|s| !s.is_empty())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+    }
+}
+
+/// Bind this host to `memory`, as typed; `None` makes it local.
+pub fn bind(memory: Option<&str>) -> Result<()> {
+    bind_at(&home::bound_file(), memory)
+}
+
+/// [`bind`], written to the file at `path`.
+pub fn bind_at(path: &Path, memory: Option<&str>) -> Result<()> {
+    match memory {
+        Some(memory) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            }
+            std::fs::write(path, format!("{memory}\n")).with_context(|| format!("writing {}", path.display()))
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("removing {}", path.display()))),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn the_host_binding_is_kept_as_typed_until_unbound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bound = tmp.path().join("funes").join("bound");
+        assert_eq!(binding_at(&bound).unwrap(), None);
+        bind_at(&bound, Some("acme/kb")).unwrap();
+        assert_eq!(binding_at(&bound).unwrap().as_deref(), Some("acme/kb"));
+        bind_at(&bound, None).unwrap();
+        assert_eq!(binding_at(&bound).unwrap(), None);
+        // A local host has nothing to unbind.
+        bind_at(&bound, None).unwrap();
+    }
 
     use arrow_array::types::Float32Type;
     use arrow_array::{ArrayRef, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator};

@@ -26,7 +26,7 @@ fn write_transcript(source: &std::path::Path) -> (String, String) {
 async fn index_then_read_surface() {
     let db_dir = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
-    // db::funes_dir() reads $FUNES_HOME; point the whole read/write surface at the temp dir.
+    // home::dir() reads $FUNES_HOME; point the whole read/write surface at the temp dir.
     std::env::set_var("FUNES_HOME", db_dir.path());
     let (session, workdir) = write_transcript(source.path());
 
@@ -36,7 +36,7 @@ async fn index_then_read_surface() {
         .unwrap();
 
     // status: non-empty chunk count.
-    let status = funes::commands::recall::status(funes::memory::Memory::local(), false)
+    let status = funes::commands::recall::status(funes::memory::Memory::local())
         .await
         .unwrap();
     assert!(status.contains("chunks:"), "status missing chunk count: {status}");
@@ -52,7 +52,7 @@ async fn index_then_read_surface() {
     )
     .await
     .unwrap();
-    assert_ne!(out, "no results", "recall returned nothing");
+    assert!(!out.starts_with("no results"), "recall returned nothing");
     assert!(
         out.contains(&session),
         "recall should surface the indexed session: {out}"
